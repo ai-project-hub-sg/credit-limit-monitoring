@@ -5,11 +5,11 @@
 | 项目 | 状态 |
 |---|---|
 | 当前阶段 | 发现与需求整理 |
-| 本轮产物 | README 1.3-draft 需求同步后的 docs/PRD.md、docs/PROJECT_DISCOVERY.md、docs/ARCHITECTURE.md、docs/DEVELOPMENT.md、docs/TEST_PLAN.md |
+| 本轮产物 | README 1.3-draft 与本轮逐项确认同步后的 docs/PRD.md、docs/PROJECT_DISCOVERY.md、docs/ARCHITECTURE.md、docs/DEVELOPMENT.md、docs/TEST_PLAN.md |
 | 审核状态 | 待用户评审，尚未批准进入实现 |
 | 允许修改范围 | 本轮仅允许修改需求和设计文档 |
-| 产物快照 | 2026-09-28，PRD 1.3-draft；基于 README commit c0dccc7 的新增条目 |
-| 下一道审核门 | 确认异常跳变规则、`.env` 备份/权限责任和 Windows/Linux 实现部署目标 |
+| 产物快照 | 2026-09-28，PRD 1.3-draft；基于 README commit c0dccc7 及本轮逐项问答 |
+| 下一道审核门 | 确认 `.env` 备份/权限责任、后端技术选择和 Linux 部署目标；整体需求仍待审核 |
 
 ## 项目事实
 
@@ -19,6 +19,12 @@
 - 关闭或开启账号调度的接口依据来自 docs/pixle_api.md。
 - 两个根密钥按已确认要求保存在应用根目录 `.env` 并作为环境变量读取；`.env` 已被 Git 忽略。
 - 产品仅提供 Web 访问，不开发 SSH 隧道或远程数据库直连；数据库文件取得到本地后再由 DBX 读取。
+- Windows 首版交付单个可点击 `.exe`；首次运行在该文件同目录创建 `.env` 和加密数据库，后续设置从 Web 保存到数据库。
+- Linux 版也把 `.env` 和加密数据库放在程序文件同目录，其他设置同样由 Web 保存到数据库。
+- Linux 服务器已确定为 64 位 x86_64，应用交付单个可执行文件；发行版/版本尚未确定，系统运行库兼容性仍须按实际环境验证。
+- Linux 的开机启动和异常退出后的拉起由操作系统服务管理负责，应用不实现自启动或自重启。
+- 指标计算、数据回退邮件、命名阈值预设及原子批量修改以 docs/PRD.md 本轮确认口径为准；README 中较早公式不能覆盖后续确认。
+- 同一账户同一采样的所有已启用提醒统一合并为至多一封邮件；关闭的提醒不参与邮件合并，但规则结果保留审计。
 
 ## 工作规则
 
