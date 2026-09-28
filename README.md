@@ -22,6 +22,7 @@
 21.本项目先生成一个windows的包测试功能。后续会打包成liunx的包部署在服务器运行。由nginx反代后提供web服务。
 
 待确认事项的确认值
+1.0版
 1.utilization 的真实单位是0-100的百分数。值57，表示57%
 2.自动关闭调度后恢复默认采样间隔。如果不设置自动关闭调度，那么当第一次触发credit_limit_by_cost后。设置一个计数器为0，当utilization比上一次加1时，说明已经是新的1%开始。再次到1%跳变时，说明这是一个全新的1%。而且是加速采样后的完整1%。如果这个1%仍然异常。可以邮件通知用户确认异常。由于未设置自动停止调度，建议立刻人工暂停，避免损失扩大。然后恢复默认采样频率。然后设置一个指示器。是否额度异常恢复。只有当额度异常恢复，才会触发下一轮的自动采样间隔增加。否则在一轮额度异常中无需反复调整采样频率。没有意义。
 3.同一异常的邮件冷却、恢复判定和收件人范围。 异常邮件一个事件只发一封，无需反复发送。收件人由用户在web界面配置。不同的pixel账户，甚至同一个pixel账户管理的不同accout都可以配置不同的通知人。恢复判断了为credit_limit_by_cost上升。credit_limit_by_delta大于中档设置。
@@ -32,3 +33,12 @@
 8.全局自动暂停与账号级设置的优先级是否固定为“全局关闭优先，账号级只能进一步关闭”。 全部关闭后，账号级不生效。账号级只在全局设为开启时才生效。
 9.默认账号和密码是否只用于 Windows 测试包；Linux 首次启动是否改为安装时设置。默认账号密码linux安装时也默认。等用户第一次登录后修改。
 10.原始缓存最大用量按字节、文件数还是两者同时限制。原始缓存最大用量指的是占用的存储字节数。
+
+1.3-draft版
+1.credit_limit_by_cost的计算规则修改。由于cost会持续增加，但是utilization在不足1%时，不会改变。所以会造成每一次utilization刚满1%时，会出现一次制度性的credit_limit_by_cost下降。可能出现假下降误报。修改为不再实时计算credit_limit_by_cost。而是当检测到utilization跳变时。将跳变当次记为N，将前一次记录记为O。credit_limit_by_cost=（cost_o\*0.5+cost_n\*0.5）/utilization_o\*100
+2.credit_limit_by_delta与credit_limit_by_cost类似。不再计算每一次记录。而是当utilization跳变时，才计算。而且他应当记录上一次utilization跳变时的cost。计算两次utilization跳变之间cost差值。然后计算出这1%对应的credit_limit_by_delta。另外如果是初始化或者重启后，最初的1%不做预估，因为最初的cost可能并不对应刚跳变的utilization。计算出来的数值偏差估计无法保证。所以要从刚记录到utilization后开始计算。
+3.量级示例，cost=318.24 utilization=16 cost/utilization的量级为318.24/16*100=1989
+4.credit_limit_by_cost和credit_limit_by_delta分别发一封异常通知。
+5.数据库的两份密钥保存在根目录下的.env文件中。作为环境变量被读取。
+6.无需ssh远程连接。只允许web访问。数据库从dbx读取需要先用户自行登录服务器下载db文件，在本地dbx访问。无需开发ssh到服务器的数据库。
+7.新增两个指标credit_limit_by_cost_real_time,等于最新一条记录的cost/utilization/*100，credit_limit_by_delta_real_time，等于(最新一条记录的cost-最近一次utilization跳变的cost)\*100
