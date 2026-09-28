@@ -5,24 +5,27 @@
 | 项目 | 状态 |
 |---|---|
 | 当前阶段 | 发现与需求整理 |
-| 本轮产物 | docs/PRD.md、docs/PROJECT_DISCOVERY.md、docs/ARCHITECTURE.md、docs/DEVELOPMENT.md、docs/TEST_PLAN.md |
+| 本轮产物 | README 1.3-draft 需求同步后的 docs/PRD.md、docs/PROJECT_DISCOVERY.md、docs/ARCHITECTURE.md、docs/DEVELOPMENT.md、docs/TEST_PLAN.md |
 | 审核状态 | 待用户评审，尚未批准进入实现 |
 | 允许修改范围 | 本轮仅允许修改需求和设计文档 |
-| 下一道审核门 | 确认范围、关键计算口径、密钥轮换策略和部署目标 |
+| 产物快照 | 2026-09-28，PRD 1.3-draft；基于 README commit c0dccc7 的新增条目 |
+| 下一道审核门 | 确认异常跳变规则、`.env` 备份/权限责任和 Windows/Linux 实现部署目标 |
 
 ## 项目事实
 
-- 根目录当前只有 README 和 docs/pixle_api.md，没有业务代码、依赖清单或 Git 仓库。
-- 需求来源为根目录 readme.md。
+- 仓库当前位于 Git `main`；没有业务代码、依赖清单、迁移、构建命令或 CI。
+- 需求来源为根目录 README.md；2026-09-28 新增的 1.3-draft 条目改变了指标计算时点、告警拆分、密钥保管和数据库访问边界。
 - Pixel 登录、账号列表、用量和原始数据处理的接口依据来自关联项目 ai-pixel-analysis/docs/api.md。
 - 关闭或开启账号调度的接口依据来自 docs/pixle_api.md。
+- 两个根密钥按已确认要求保存在应用根目录 `.env` 并作为环境变量读取；`.env` 已被 Git 忽略。
+- 产品仅提供 Web 访问，不开发 SSH 隧道或远程数据库直连；数据库文件取得到本地后再由 DBX 读取。
 
 ## 工作规则
 
 - 需求、架构和测试文档中的“必须”表示产品要求；“建议”表示待评审方案；“待确认”不能视为批准。
 - 在需求审核通过前，不创建产品原型、后端、前端、数据库迁移或安装包。
 - 不把未存在的构建命令、依赖版本或接口响应字段写成已实现事实。
-- 所有密钥、Token、SMTP 密码和 Pixel 账号密码只能在运行时安全存储，不能写入日志、示例配置或提交内容。
+- Token、SMTP 密码和 Pixel 账号密码必须加密存储；两个根密钥仅允许存在于受限权限的 `.env`、进程环境和经重新验证的短时查看页面，不能写入日志、示例配置或提交内容。
 - 影响账号权限、数据模型、密钥、上游 API 或部署方式的变更，需要更新 PRD 和架构文档，并重新经过审核。
 
 ## 完成定义

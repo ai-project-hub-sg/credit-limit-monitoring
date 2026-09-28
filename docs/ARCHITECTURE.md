@@ -1,12 +1,12 @@
 # 建议架构
 
-> 对应 PRD 1.3-draft。根据用户新增的 DBX 等客户端凭密码打开要求，推荐 SQLCipher 4 默认文件格式及口令模式；Go 强制依赖已移除。第 9 节为官方来源依据，本轮没有构建或客户端实测，整体仍待评审。
+> 对应 PRD 1.3-draft。已吸收 2026-09-28 README 新增的跳变稳定指标、逐采样实时指标、独立告警邮件、应用根目录 `.env` 和无 SSH 数据库访问边界。推荐 SQLCipher 4 默认文件格式及口令模式；Go 强制依赖已移除。第 9 节为既有选型依据，本轮没有构建或客户端实测，整体仍待评审。
 
 ## 1. 目标与已确认边界
 
-建议采用单体应用服务，包含 Web API、静态前端服务、Pixel 连接、调度器、采集、原始文件队列、ETL、告警、密钥轮换和清理任务。后端语言和框架待确定，不依赖 Go 工具链。加密数据库建议使用 SQLCipher 4 默认格式以满足第三方客户端读取目标；原始 JSON 保存为本地文件。
+建议采用单体应用服务，包含 Web API、静态前端服务、Pixel 连接、调度器、采集、原始文件队列、ETL、指标/告警、密钥轮换和清理任务。后端语言和框架待确定，不依赖 Go 工具链。加密数据库建议使用 SQLCipher 4 默认格式以满足本地第三方客户端读取目标；原始 JSON 保存为本地文件。产品对外只提供 Web 访问，不实现数据库 SSH 隧道或远程直连。
 
-首版必须支持多个 Pixel 租户、每租户多个管理账号，仅纳入 `platform=openai` 的监控账号。Windows 和后续 Linux 都使用默认本地凭据，第一次登录强制修改。两个密钥分别为 16 个随机字节编码的 32 个十六进制字符，允许独立轮换。
+首版必须支持多个 Pixel 租户、每租户多个管理账号，仅纳入 `platform=openai` 的监控账号。Windows 和后续 Linux 都使用默认本地凭据，第一次登录强制修改。两个密钥分别为 16 个随机字节编码的 32 个十六进制字符，保存在应用根目录 `.env`、作为环境变量加载并允许独立轮换。
 
 ```text
 Browser
@@ -16,7 +16,7 @@ Browser
             -> Pixel client (tenant + admin session)
             -> raw spool (complete JSON + durable file metadata)
             -> ETL gate -> Storage adapter -> encrypted SQLite
-            -> Rule engine -> email worker
+       -> Metric / rule engine -> cost and delta event streams -> email worker
             -> Schedule controller -> Pixel PUT API
        -> Key rotation coordinator
        -> Raw cache janitor (retention days + byte limit)
@@ -34,8 +34,8 @@ Browser
 - `scheduler`：按监控账号计算下一次采样，维护普通/告警间隔和账号锁。
 - `pipeline`：请求、完整原始 JSON 落盘、解析、指标计算、ETL 入库和补偿。
 - `store`：加密 SQLite 存储适配、迁移、单写事务、查询、幂等、轮换和第三方兼容性；建议底层为 SQLCipher。
-- `rules`：cost 趋势、delta 档位、两次 1 个百分点跳变和恢复锁。
-- `alert`：异常事件、收件人解析、单事件通知、发送重试和审计。
+- `rules`：有效跳变识别、两个稳定指标、两个实时指标、cost 趋势、delta 档位、加速观察计数和独立恢复锁。
+- `alert`：cost/delta 独立异常事件、收件人解析、每事件一次通知、发送重试和审计。
 - `schedule-controller`：只负责按规则调用 Pixel `schedulable=false/true` 并记录结果。
 - `security`：数据库密钥、机密信息密钥、敏感字段封装、轮换和脱敏。
 - `web`：页面、配置校验、确认弹窗、维护状态和任务状态。
@@ -47,19 +47,19 @@ Browser
 
 ### 3.1 采样任务
 
-每个监控账号独立维护以下持久化状态：`enabled`、`current_interval`、`next_run_at`、`last_success_at`、`pixel_schedulable_state`、`active_alert_event_id`。Pixel 调度被暂停时本地监控仍可继续；只有本地监控关闭或策略明确暂停采集才停止 usage 请求。
+每个监控账号独立维护以下持久化状态：`enabled`、`current_interval`、`next_run_at`、`last_success_at`、`pixel_schedulable_state`、`last_jump_sample_id`、`process_generation`、`active_cost_event_id`、`active_delta_event_id`。Pixel 调度被暂停时本地监控仍可继续；只有本地监控关闭或策略明确暂停采集才停止 usage 请求。
 
 任务生命周期至少包含 `queued`、`fetching`、`raw_saved`、`etl_pending`、`stored`、`alerting`、`action_pending`、`completed`、`failed`。密钥轮换时新 ETL 进入 `paused`，采集只允许在原始缓存仍可写且认证有效时继续。
 
-### 3.2 两次跳变规则
+### 3.2 跳变、指标和事件规则
 
-首次 cost 指标异常建立事件并切到默认 30 秒告警间隔。不自动暂停时计数器置 0：第一次相对上一采样增加 1 个百分点记录边界，第二次再增加 1 个百分点完成一个加速后的完整区间。例如 57 触发、58 为第一边界、59 为第二边界，完整观察区间是 58 到 59。
+建议只接受 `utilization(current) = utilization(previous) + 1` 为有效跳变。稳定 cost 在该跳变上用前后样本平均 cost、旧 utilization 和 `*100` 计算；稳定 delta 用当前跳变 cost 与上一个有效跳变锚点 cost 的差值 `*100` 计算。进程初始化或重启后的第一个有效跳变只建立 delta 锚点。相同 utilization 只计算实时指标；跨多个百分点、回退、重置或 cost 回退不补造样本，记录原因并重建基线。
 
-逐条 `credit_limit_by_delta` 仍使用相邻成功采样。完整区间观察值若被采用必须是独立字段，不能替换逐条 delta。跨多个百分点、utilization 回退或没有第二个边界时不补造样本；退出和“仍异常”的精确定义等待 PRD R1/R2。
+同一跳变的处理顺序必须固定：读取旧锚点，计算稳定指标和规则，保存当前样本为新锚点，再计算/保存以新锚点为基准的实时 delta（因此跳变记录的实时 delta 为 0）。所有步骤在同一业务事务或可恢复状态机中完成，避免重试后锚点先行更新导致稳定 delta 变成 0。
 
-自动暂停由有效 `credit_limit_by_delta < low`、全局开启和账号允许三项共同决定。暂停 PUT 成功后恢复配置的普通间隔（默认 60 秒）；失败或结果未知不更新为已暂停。额度恢复不会自动调用 `schedulable=true`。
+稳定 cost 异常建立 cost 事件并切到默认 30 秒告警间隔。加速观察计数沿用 1.0 版：触发跳变不计入观察，后续第一次有效跳变记录起点，第二次完成观察区间。该计数与稳定 delta 的计算锚点分离。自动暂停由有效稳定 `credit_limit_by_delta < low`、全局开启和账号允许三项共同决定；实时指标不驱动动作。
 
-恢复建议在同一有效采样上满足 cost 指标上升且 delta 大于 medium；恢复后清除恢复锁，才允许新事件再次加速。告警事件的首次/确认通知阶段等待 PRD R2 定稿；收件人覆盖和继承建议见 PRD 11.2。
+cost 与 delta 分别建立事件、发送邮件和恢复：稳定 cost 严格上升恢复 cost 事件，稳定 delta 严格大于 medium 恢复 delta 事件。暂停 PUT 成功、加速观察窗口完成或 cost 事件提前恢复后恢复普通间隔；长期没有有效跳变时没有已批准的超时退出值，保持当前间隔并展示等待状态。失败或结果未知不更新为已暂停，额度恢复不会自动调用 `schedulable=true`。
 
 ## 4. 数据模型和一致性
 
@@ -71,9 +71,9 @@ Browser
 - `pixel_admin_accounts`：租户引用、加密登录账号/密码、认证状态和默认收件人。
 - `pixel_sessions`：管理账号引用、加密 Token/Cookie、过期信息和最后认证结果。
 - `monitored_accounts`：租户引用、`account_id`、可用管理账号关系、平台、基础信息、账号阈值、自动暂停和收件人覆盖。
-- `usage_samples`：采集唯一标识、监控账号引用、原始字段、两个指标、前值引用、规则结果、质量原因和处理状态。
+- `usage_samples`：采集唯一标识、监控账号引用、原始字段、四个指标、紧邻前值、跳变锚点、进程启动代次、规则结果、质量原因和处理状态。
 - `raw_files`：采集标识、归属、绝对路径、字节大小、校验值、抽取状态和保留状态。
-- `alert_events`：触发采样、规则版本、前后值、阶段、跳变计数、边界样本、间隔、恢复锁和结束原因。
+- `alert_events`：事件类型 cost/delta、触发采样、规则版本、前后值、阶段、观察计数、边界样本、间隔、恢复锁和结束原因。
 - `email_deliveries`：事件/通知类型、收件人快照、模板版本、结果、重试和时间。
 - `schedule_actions`：账号引用、请求动作、请求体摘要、响应状态、最终状态和重试。
 - `job_runs`：采集、ETL、清理、轮换任务的开始、结束、状态和错误。
@@ -87,23 +87,32 @@ Browser
 
 ## 5. 指标、字段和上游契约
 
-上游 `utilization` 是 0 到 100 的百分数，57 表示 57%，README 公式按百分数数值计算。`cost/user_cost` 在关联 API 文档的 `SevenDay.WindowStats` 中；`requests/tokens` 的实际 JSON 路径和缺失行为仍需脱敏样例确认。解析层必须保留完整 envelope 和字段质量原因。
+上游 `utilization` 是 0 到 100 的百分数，57 表示 57%，README 1.3-draft 已确认指标按百分数口径乘以 100。`cost/user_cost` 在关联 API 文档的 `SevenDay.WindowStats` 中；`requests/tokens` 的实际 JSON 路径和缺失行为仍需脱敏样例确认。关联项目文档中的旧 `estimated_total_quota = round(cost / utilization)` 不能复用为本项目算法。解析层必须保留完整 envelope 和字段质量原因。
+
+指标计算应由纯函数与显式状态共同完成：
+
+- 每条有效采样：`credit_limit_by_cost_real_time = cost / utilization * 100`。
+- 已有跳变锚点时：`credit_limit_by_delta_real_time = (cost - jump_anchor_cost) * 100`。
+- 有效 +1 跳变：`credit_limit_by_cost = ((previous_cost + current_cost) / 2) / previous_utilization * 100`。
+- 有效 +1 跳变且存在同一进程启动代次内的旧跳变锚点：`credit_limit_by_delta = (current_cost - previous_jump_cost) * 100`。
+
+稳定字段在平台期保持空值/不可计算原因，查询层再关联最近稳定值，不能把上次值复制到新样本。进程每次启动生成新的 `process_generation`；该代次的第一跳只建立 delta 锚点，以满足重启后最初 1% 不估算的要求。指标算法需要版本号，公式变化不能静默重算历史记录。
 
 接口适配层只输出内部 DTO，不让上游响应字段直接扩散到页面。主机、端口、超时、`source` 和时区可配置；默认请求使用 `source=local`、`timezone=Asia/Shanghai`。HTTP 401、业务错误、格式错误和网络超时分别记录。
 
 ## 6. 加密和密钥轮换
 
-- 数据库口令用于打开文件层加密；建议使用 SQLCipher 的口令及 rekey 能力。具体绑定和恢复流程须测试，不能把一次 rekey 调用等同于完整崩溃恢复方案。密钥不得明文放在数据库同目录配置中。[S1]
+- 数据库口令用于打开文件层加密；建议使用 SQLCipher 的口令及 rekey 能力。具体绑定和恢复流程须测试，不能把一次 rekey 调用等同于完整崩溃恢复方案。按用户要求，数据库口令与机密信息密钥保存在应用根目录 `.env`，但不得同时写入数据库、日志、命令行参数或其他明文配置。[S1]
 - 机密信息密钥独立保护 Pixel 登录账号/密码、Token/Cookie、SMTP 密码等可逆秘密，并允许独立轮换。
 - 两个密钥的生成格式仍是 16 个随机字节编码的 32 个十六进制字符，重启不能覆盖。数据库侧建议直接把 32 字符文本作为 passphrase 输入，以便与 DBX 密码输入一致；SQLCipher 原始密钥模式则要求 32 字节/64 hex 字符，不可混用。第二密钥的应用层算法与派生方案另行设计。[S1]
-- 本地登录密码必须使用 Argon2id 或同等级强哈希，不得以可逆明文保存。是否将哈希封装后再用机密信息密钥加密，及启动时如何取得密钥，待 PRD R3 确认。
+- 本地登录密码必须使用 Argon2id 或同等级强哈希，不得以可逆明文保存。是否将哈希封装后再用机密信息密钥加密仍是设计选择，但启动密钥来源已确定为应用根目录 `.env` 加载的环境变量。
 - 查看和轮换两个密钥分别要求操作级密码验证，页面短时显示且不进入日志、错误、审计或邮件。
 
-轮换前建议在受控内存中保留调度配置与必要凭据，使用不依赖业务数据库的进度通道与持久化文件清单；不得把明文凭据写入清单。期间发生重登时，新会话的安全保存方式需纳入轮换设计。轮换协调器要有版本、阶段、旧/新密钥可用性（不记录值）、进度、失败原因和可恢复日志。任一轮换时暂停对外数据库服务和 ETL；原始 JSON 及独立文件元数据继续进入磁盘队列。验证新密钥读写、存量解密和事务一致后切换版本，再按时间顺序补偿 ETL。轮换中途重启必须能根据阶段继续或回退，不产生半轮换状态。
+轮换前建议在受控内存中保留调度配置与必要凭据，使用不依赖业务数据库的进度通道与持久化文件清单；不得把明文凭据写入清单。轮换协调器要有版本、阶段、旧/新密钥可用性（不记录值）、进度、失败原因和可恢复日志。任一轮换时暂停对外数据库服务和 ETL；原始 JSON 及独立文件元数据继续进入磁盘队列。验证新密钥读写、存量解密和事务一致后，使用同目录临时文件、权限继承、落盘同步和原子替换更新 `.env`；只有数据与 `.env` 都切换成功才提交新版本。失败时恢复旧数据与旧 `.env`，再按时间顺序补偿 ETL。
 
 ### 6.1 外部客户端兼容基线（推荐）
 
-兼容目标是文件格式、参数和口令解释一致，不只是算法名称相同或密码正确。优先验证 DBX 本地连接以及带 SQLCipher 的 DB Browser；普通 SQLite 客户端不因此获得加密支持。[S1][S2][S4]
+兼容目标是文件格式、参数和口令解释一致，不只是算法名称相同或密码正确。只验证取得到本地的一致性加密文件：优先使用 DBX 本地连接，并以带 SQLCipher 的 DB Browser 交叉验证；普通 SQLite 客户端不因此获得加密支持。[S1][S2][S4]
 
 | 项目 | 推荐基线 |
 |---|---|
@@ -129,15 +138,15 @@ Browser
 
 ## 8. 部署、恢复和未决选择
 
-Windows 测试包至少包含可执行文件、数据目录约定、默认配置、启动说明和校验值。Linux 后续以单服务运行，由 Nginx 负责外部 TLS、反向代理和安全头；两者均保留默认凭据和首次改密流程。
+Windows 测试包至少包含可执行文件、应用根目录/数据目录约定、启动说明和校验值。Linux 后续以单服务运行，由 Nginx 负责外部 TLS、反向代理和安全头；两者均保留默认凭据和首次改密流程。`.env` 位于应用根目录，不属于可公开下载的静态资源目录，进程以最小权限服务账号读取。
 
-建议备份集合包括一致性加密数据库、按保留策略仍存在的原始文件、格式参数和密钥版本元数据；恢复需要匹配口令/密钥。制作一致性备份时验证所选驱动的备份/导出机制，不能在持续写入时直接只拷贝一个主文件并假定数据完整；目的文件必须保留加密。[S1][S6]
+建议备份集合包括一致性加密数据库、按保留策略仍存在的原始文件、格式参数和密钥版本元数据；恢复需要匹配口令/密钥。制作一致性备份时验证所选驱动的备份/导出机制，不能在持续写入时直接只拷贝一个主文件并假定数据完整；目的文件必须保留加密。[S1][S5]
 
-DBX 官方文档明确本地 SQLite 与 SSH 远程 SQLite 是不同路径，SSH Worker v1 不支持远程 SQLCipher。因此 Linux 场景建议先由应用生成加密一致性备份，复制到本机，再用 DBX 只读查看。不得把该文档限制扩展成所有未来 DBX 版本都不支持；发布前记录实际客户端版本并复核远程能力。[S5]
+Linux 场景不开发 SSH 或远程数据库访问。用户应在数据库停止写入时复制完整数据库集合，或通过实现阶段验证的一致性备份机制取得单个加密备份文件，再在本机用 DBX 只读查看；直接复制活动主文件可能遗漏 WAL 数据。服务器登录、文件下载和传输安全由部署运维流程负责，不属于产品功能。
 
-Windows/Linux 的密钥保管、无人值守重启、跨机器恢复、实际非 Go 绑定与打包尚未定稿，见 PRD R3。SQLCipher 选型不取消首次改密、原始缓存或独立密钥轮换要求。
+`.env` 使 Windows/Linux 可无人值守重启，但文件权限、离线备份、跨机器恢复、实际非 Go 绑定与打包尚未定稿，见 PRD R2/R3。SQLCipher 选型不取消首次改密、原始缓存或独立密钥轮换要求。
 
-当前仍停在需求评审，未批准制作低保真、原型或业务代码。需求评审需要先处理 PRD R1（计算量纲与回退）、R2（异常生命周期/邮件）和 R3（密钥保管与访问方式），并补齐脱敏 usage 与 PUT 响应样例；通过评审后按批准的阶段推进。
+当前仍停在需求评审，未批准制作低保真、原型或业务代码。需求评审需要先处理 PRD R1（异常跳变与重建基线）、R2（`.env` 权限/备份责任）和 R3（实现与部署目标），并补齐脱敏 usage 与 PUT 响应样例；通过评审后按批准的阶段推进。
 
 
 ## 9. 选型核验依据
@@ -148,7 +157,6 @@ Windows/Linux 的密钥保管、无人值守重启、跨机器恢复、实际非
 - [S2] DBX 官方 Getting Started 默认开启 sqlite-sqlcipher；v0.5.95 发布说明明确支持 SQLCipher 4/3/2/1 文件及密码提示。引用版本是证据，不称为最新版本。来源：`https://dbxio.com/en/docs/getting-started`、`https://github.com/t8y2/dbx/releases/tag/v0.5.95`。
 - [S3] SQLite3 Multiple Ciphers 官方文档：非 legacy 输出通常不兼容原始 SQLCipher；SQLCipher cipher 的 legacy=4 提供 v4 参数。来源：`https://utelle.github.io/SQLite3MultipleCiphers/docs/ciphers/cipher_legacy_mode/`、`https://utelle.github.io/SQLite3MultipleCiphers/docs/ciphers/cipher_sqlcipher/`。
 - [S4] DB Browser 官方 Encrypted Databases 文档：SQLCipher 支持、口令/原始密钥模式、v4 默认参数。来源：`https://github.com/sqlitebrowser/sqlitebrowser/wiki/Encrypted-Databases`。
-- [S5] DBX 官方隧道/代理文档“文件型数据库”：SQLite SSH Worker v1 尚不支持远程 SQLCipher。来源：`https://dbxio.com/cn/docs/ssh-tunnel`。
-- [S6] SQLite 官方 Backup API：运行中数据库应使用一致性备份机制；加密目的文件的配置还需按 SQLCipher/实际绑定验证。来源：`https://www.sqlite.org/backup.html`。
+- [S5] SQLite 官方 Backup API：运行中数据库应使用一致性备份机制；加密目的文件的配置还需按 SQLCipher/实际绑定验证。来源：`https://www.sqlite.org/backup.html`。
 
 仍未确认 `sqlite3-encrypted` 的准确项目身份，不能给它推定算法或兼容性；本轮推荐基于可核实的 SQLCipher 格式和目标客户端支持。
